@@ -1,0 +1,369 @@
+/*global FD: false */
+;(function(win, common) {
+
+	var ns = 'FD.Common.Metrics';
+	if(common.nameValue(ns + '.register')) {
+		return;
+	}
+	var metrics = common.namespace(ns);
+	var plans = {};
+	var actionsTriggers = {};
+	var defaultPlan = null;
+	var debugWindow = null;
+	var debugRowHighlight = false;
+	var lastPlanHandlerRegistered = null;
+	var pageInitialized = false;
+	var jQ = null;
+
+	common.assign(metrics, {
+		register: registerPlan,
+		initializePage: initializePage,
+		plan: getPlan,
+		disable: function() {
+			lastPlanHandlerRegistered && lastPlanHandlerRegistered.disable();
+		},
+		enable: function() {
+			lastPlanHandlerRegistered && lastPlanHandlerRegistered.enable();
+		},
+		debug: showDebug,
+		elementData: getElementData
+	});
+
+	common.ready(init);
+
+	///////
+
+	function dtmLoaded() {
+		return !!win._satellite;
+	}
+
+	function init() {
+		if(!dtmLoaded()) {
+			console.log('[metrics.init] DTM library not loaded at init call.');
+		}
+		if(win.jQuery) {
+			jQ = win.jQuery;
+			jQ('body').on('click', '[data-fd-metrics-click]', processMetricsClick);
+		} else {
+			console.log('[metrics.init] jQuery library not loaded, document metrics click handling not available');
+		}
+	}
+
+	function appBase(app) {
+		var base = common.nameValue('FD.' + app + '.Metrics');
+		return (base && base.provider) ? base : null;
+	}
+
+	function registerPlan(plan, baseProvider) {
+		var handler = plans[plan.app];
+		if(!handler) {
+			var base = baseProvider || appBase(plan.app);
+			if(!base) {
+				console.log('[metrics.registerPlan] Metrics provider missing for app ' + plan.app);
+				return;
+			}
+			handler = plans[plan.app] = {
+				plan: plan,
+				provider: base.provider,
+				enabled: dtmLoaded()
+			};
+			common.assign(handler, {
+				data: retrieveMetricsData.bind(handler),
+				page: firePageBottom.bind(handler),
+				direct: fireDirect.bind(handler),
+				enable: function() {
+					handler.enabled = dtmLoaded();
+				},
+				disable: function() {
+					handler.enabled = false;
+				}
+			});
+			base.handler = handler;
+			if(!defaultPlan) {
+				defaultPlan = handler;
+			}
+			plan.handler = handler;
+			lastPlanHandlerRegistered = handler;
+            console.log('[metrics.registerPlan] Plan registered for app ' + plan.app, plan);
+		}
+		return handler;
+	}
+
+	function getPlan(app) {
+		var handler = (app) ? plans[app] : defaultPlan;
+		return handler && handler.plan;
+	}
+
+	function parseAction(action) {
+		if(typeof action === 'string') {
+			action = JSON.parse(action);
+		}
+		return action || null;
+	}
+
+	const jsonRegex = /{\(([.,a-zA-Z0-9_: \$]*)\)}/gm;
+	function parseMetricsValue(val, data, action) {
+		var _this = this;
+		return val.toString().replace(jsonRegex, function (s, token) {
+			var t = token.split(',');
+			var v = getMetricsValue.call(_this, data, t[0], action);
+			return v !== null ? ((t[1] || '') + v + (t[2] || '')) : '';
+		});
+	}
+
+	function getMetricsValue(data, name, action) {
+		var _this = this;
+		var val = null;
+		do {
+			// try to get value from passed in data
+			if (data) {
+				val = common.nameValue(name, data, '_');
+				if (typeof(val) !== 'undefined') {
+					break;
+				}
+			}
+			// try to get value from action variable data
+			val = action.variables[name];
+			if (val) {
+				break;
+			}
+			// fix for MTX-20222
+			if (val === `{(${name})}`) {
+				val = null;
+				break;
+			}
+			// try to get value from application provider function
+			if (_this.provider) {
+				val = _this.provider(name);
+				if (typeof(val) !== 'undefined') {
+					break;
+				}
+			}
+			val = null;
+		} while (false);
+		if(val !== null) {
+			// process any substitutions
+			val = parseMetricsValue.call(_this, val, data, action);
+		}
+		return val;
+	}
+
+	function retrieveMetricsData(action, data, trigger) {
+		var result = {};
+		var actionItem = action && action.id && this.plan.actions[action.id] || action.actionItem;
+		var _this = this;
+		if(data && (data.jquery || data instanceof Element)) {
+			data = getElementData(data);
+		}
+		if(actionItem && actionItem.variables) {
+			common.objectForEach(actionItem.variables, function(val, name) {
+				if(val === true) {
+					val = getMetricsValue.call(_this, data, name, action);
+				}
+				if(val !== null) {
+					var nameSplit = name.split('_');
+					if(nameSplit.length === 2) {
+						if(!result[nameSplit[0]]) {
+							result[nameSplit[0]] = {};
+						}
+						result[nameSplit[0]][nameSplit[1]] = parseMetricsValue.call(_this, val, data, action);
+					} else {
+						console.log('[metrics.retrieveData] Invalid variable name ' + name);
+					}
+				}
+			});
+		} else {
+			console.log('[metrics.retrieveData] Invalid action id ' + (action && action.id));
+		}
+		debugAction(actionItem, result);
+		return result;
+	}
+
+	function initializePage(action) {
+		try {
+			var base = appBase(action && action.app);
+			if(base) {
+				win.digitaldata = retrieveMetricsData.call({
+					plan: {
+						action: {}
+					},
+					provider: base.provider
+				}, action);
+				pageInitialized = true;
+				console.log('[metrics.initPage] data set ->', win.digitaldata, action);
+
+			} else {
+				console.log('[metrics.initPage] app provider not found');
+			}
+		} catch(ex) {
+			console.log('[metrics.initPage] uncaught exception', ex, action);
+		}
+	}
+
+	function firePageBottom() {
+		let pageAction = {};
+		let action = {};
+		try {
+			if (FD?.Brand?.Context?.pageAction) {
+				pageAction = JSON.parse(FD?.Brand?.Context?.pageAction);
+				action = FD?.Brand?.Metrics?.handler?.plan?.actions[pageAction.id];
+			}
+		} catch(error){
+			console.error("[metrics.base] firePageBottom", error);
+		}
+
+		if (!action?.direct){
+			triggerSatelliteBottom();
+			if (action?.altdirect) this.direct({
+				actionItem: action,
+				...pageAction
+			});
+		} else {
+			window.digitaldata = {};
+			triggerSatelliteBottom();
+			this.direct({
+				actionItem: action,
+				...pageAction
+			});
+		}
+	}
+
+	function triggerSatelliteBottom(){
+		try {
+			if(win._satellite) {
+				win._satellite.pageBottom();
+				console.log('[metrics.firePageBottom] -> page bottom fired');
+			} else {
+				console.log('** DTM CALL DISABLED ** [metrics.firePageBottom]');
+			}
+		} catch(ex) {
+			console.log('[metrics.firePageBottom] uncaught exception', ex);
+		}
+	}
+
+	function fireDirect(actionValue, data) {
+		try {
+			var action = parseAction(actionValue);
+			var directAction = action && this.plan.actions[action.id];
+			if (directAction && (directAction.direct || directAction.altdirect)) {
+				if(filterCheck.call(this, action)) {
+					if(dtmLoaded() && this.enabled) {
+						win.digitaldata = this.data(action, data);
+						if(directAction.direct) {
+							win._satellite.track(directAction.direct);
+							console.log('[metrics.fireDirect] -> ' + directAction.direct, common.assign(true, {}, data), action);
+						}
+						if(directAction.altdirect) {
+						    win._satellite.track(directAction.altdirect);
+							console.log('[metrics.fireDirect] -> ' + directAction.altdirect, common.assign(true, {}, data), action);
+						}
+					} else {
+						console.log('** DTM CALL DISABLED ** [metrics.fireDirect - direct] -> ' + directAction?.direct, common.assign(true, {}, data), action);
+						console.log('** DTM CALL DISABLED ** [metrics.fireDirect - altdirect] -> ' + directAction?.altdirect, common.assign(true, {}, data), action);
+					}
+				}
+			} else {
+				console.log('[metrics.fireDirect] invalid action', action, directAction);
+			}
+		} catch(ex) {
+			console.log('[metrics.fireDirect] uncaught exception', ex, actionValue, data);
+		}
+	}
+
+	function filterCheck(action) {
+		var valid = true;
+		var actionItem = action && action.id && this.plan.actions[action.id];
+		switch(actionItem && actionItem.filter) {
+			case 'oncePerPage':
+				valid = !actionsTriggers[action.id];
+				actionsTriggers[action.id] = true;
+				break;
+			case 'oncePerSession':
+				var key = 'fd-metrics-trigger-' + action.id;
+				valid = !win.sessionStorage.getItem(key);
+				win.sessionStorage.setItem(key, true);
+				break;
+			case 'oncePerNameplate':
+				// TODO - look at using parameter as the key
+				break;
+		}
+		return valid;
+	}
+
+	function getElementData(el) {
+		var $el = jQ && jQ(el);
+		if(!$el || $el.length === 0) {
+			return {};
+		}
+		var data = null;
+		var attr = $el.attr('data-fd-metrics-data');
+		if(attr) {
+			try {
+				data = JSON.parse(attr);
+			} catch (e) { }
+		}
+		return common.assign(
+			getElementData(
+				$el.parent()
+					.closest('[data-fd-metrics-data]')
+			),
+			data || {}
+		);
+	}
+
+	function processMetricsClick() {
+		try {
+			var actionValue = jQ && jQ(this).attr('data-fd-metrics-click');
+			if (actionValue) {
+				var action = JSON.parse(actionValue);
+				var handler = plans[action.app];
+				if (handler) {
+					handler.direct(action, this);
+				} else {
+					console.log('[metrics.processMetricsClick] handler not found for ' + action.app);
+				}
+			}
+		} catch(ex) {
+			console.log('[metrics.processMetricsClick] uncaught exception', ex);
+		}
+	}
+
+	function showDebug () {
+		if(!debugWindow || debugWindow.closed) {
+			debugWindow = win.open('', 'fdmetricsdebugger', 'height=500,width=500,resizable=1,scrollbars=1,location=0');
+			debugWindow.document.open();
+			debugWindow.document.write('<html><head><title>Common Metrics Debug Window</title><style>body { font-family: "Lucida Sans Unicode", "Lucida Grande", Sans-Serif; font-size: 0.8em; margin:0; padding: 0; } h1, h2 { margin: 0 0 .3em 0; } div { padding: 0.8em; } dl { margin: 0 1em; } dt { float: left; width: 12em; font-weight: bold; } dd { margin-left: 12em; }</style><script>function addAction(action) { document.getElementsByTagName("body")[0].appendChild(action); window.scrollTo(0, document.body.scrollHeight); }</script></head><body></body></html>');
+			debugWindow.document.close();
+		}
+		debugWindow.focus();
+	}
+
+	function debugAction(actionItem, data) {
+
+		if(jQ && debugWindow && !debugWindow.closed) {
+			if(actionItem) {
+				var $action = jQ('<div></div>').css({backgroundColor: debugRowHighlight ? '#ccccff' : '#eeeeff'})
+					.append(jQ('<h1></h1>').text('[' + (actionItem.direct ? 'direct' : 'page') + '] ' + (actionItem.name || '')));
+				data && common.objectForEach(data, function (val, name) {
+					var hasProp = false;
+					var $prop = jQ('<dl></dl>');
+					val && common.objectForEach(val, function (v, k) {
+						$prop.append(jQ('<dt></dt>').text(k))
+							.append(jQ('<dd></dd>').text(v));
+						hasProp = true;
+					});
+					if (hasProp) {
+						$action.append(jQ('<h2></h2>').text(name));
+						$action.append($prop);
+					}
+				});
+				debugWindow.addAction($action.get(0));
+				debugWindow.focus();
+				debugRowHighlight = !debugRowHighlight;
+			}
+		} else {
+			debugWindow = null;
+		}
+	}
+
+})(window, FD.Common);
